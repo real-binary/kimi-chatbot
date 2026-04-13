@@ -1,0 +1,95 @@
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from langdetect import detect, DetectorFactory
+from deep_translator import GoogleTranslator
+import random
+from sentence_transformers import SentenceTransformer, util
+
+from dataset import DATASET  # Twój dataset w formacie [(prompt, response), ...]
+
+DetectorFactory.seed = 0
+
+# ----- Konfiguracja -----
+MODEL_NAME = "gpt2"  # Offline, darmowy
+SYSTEM_PROMPT = "You are Kimi, a friendly assistant who answers clearly and concisely."
+SUPPORTED_LANGUAGES = ["en", "pl", "de", "fr", "es", "it"]
+
+# ----- Ładowanie modeli -----
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+
+# Embeddingi do wychwytywania literówek / podobieństwa
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Przygotowanie dataset
+prompts = [p for p, r in DATASET]
+responses = [r for p, r in DATASET]
+prompt_embeddings = embed_model.encode(prompts, convert_to_tensor=True)
+
+# ----- Funkcje pomocnicze -----
+def apply_system_prompt(text):
+    sentences = text.split(".")
+    text = ".".join(sentences[:2]).strip()  # maksymalnie 2 zdania
+    if text == "":
+        text = "Hello."
+    return text
+
+def generate_fallback():
+    return "I'm not sure about that, but I can try to help based on what I know."
+
+def generate_dataset_response(user_input):
+    # Wyszukiwanie podobnych promptów w dataset (nawet z literówkami)
+    input_emb = embed_model.encode(user_input, convert_to_tensor=True)
+    cosine_scores = util.cos_sim(input_emb, prompt_embeddings)[0]
+    
+    # Pobieramy wszystkie indeksy z podobieństwem powyżej 0.5
+    top_indices = [i for i, score in enumerate(cosine_scores) if score >= 0.5]
+    
+    if not top_indices:
+        return None  # brak dopasowania → fallback
+
+    # Jeśli kilka dopasowań, losujemy jedną odpowiedź
+    chosen_idx = random.choice(top_indices)
+    return responses[chosen_idx]
+
+def generate_generative_response(user_input):
+    prompt = f"{SYSTEM_PROMPT}\nUser: {user_input}\nAI:"
+    inputs = tokenizer(prompt, return_tensors="pt")
+    outputs = model.generate(**inputs, max_new_tokens=150, do_sample=True, temperature=0.7, top_p=0.9)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True).replace(prompt, "").strip()
+    return response
+
+# ----- Chat konsolowy -----
+print("Kimi (generative + dataset) is ready! Type 'quit' to exit.")
+
+while True:
+    user_input = input("You: ").strip()
+    if user_input.lower() == "quit":
+        break
+
+    try:
+        # Wykrycie języka użytkownika
+        user_lang = detect(user_input)
+        if user_lang not in SUPPORTED_LANGUAGES:
+            user_lang = "en"
+
+        # Tłumaczenie do angielskiego jeśli potrzeba
+        input_en = GoogleTranslator(source='auto', target='en').translate(user_input) if user_lang != "en" else user_input
+
+        # 1️⃣ Sprawdź dataset
+        dataset_response = generate_dataset_response(input_en)
+        if dataset_response:
+            response_en = dataset_response
+        else:
+            # 2️⃣ Generatywny model
+            response_en = generate_generative_response(input_en)
+
+        # 3️⃣ Tłumaczenie odpowiedzi na język użytkownika
+        response_final = GoogleTranslator(source='en', target=user_lang).translate(response_en) if user_lang != "en" else response_en
+
+        response_final = apply_system_prompt(response_final)
+
+        print("AI:", response_final)
+
+    except Exception as e:
+        print("Błąd:", e)
